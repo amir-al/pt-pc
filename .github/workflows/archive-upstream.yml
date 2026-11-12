@@ -1,0 +1,104 @@
+# Archives code and GitHub Releases from LoreanXavier/pt-pc into this fork.
+# Non-destructive: no force pushes, no branch/tag deletions, no asset clobber.
+name: Archive upstream source and releases
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '37 3 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pt-pc-upstream-archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      UPSTREAM_REPO: LoreanXavier/pt-pc
+      ARCHIVE_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the archival fork (complete Git history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Safely sync upstream commits, other branches, and tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream '+refs/heads/*:refs/remotes/upstream/*'
+
+          # Merge rather than reset: preserve this workflow and any fork-only commits.
+          git merge --no-edit upstream/main
+          git push origin HEAD:main
+
+          # Preserve non-main upstream branches in a dedicated branch namespace.
+          # If upstream rewrites history, the push fails instead of destroying history.
+          while IFS= read -r ref; do
+            branch="${ref#refs/remotes/upstream/}"
+            if [[ "$branch" != 'main' && "$branch" != 'HEAD' ]]; then
+              git push origin "${ref}:refs/heads/upstream-archive/${branch}"
+            fi
+          done < <(git for-each-ref --format='%(refname)' refs/remotes/upstream)
+
+          # Never force-update tags: refuse upstream tag rewrites.
+          git fetch upstream 'refs/tags/*:refs/tags/*'
+          git push origin --tags
+
+      - name: Copy all published releases and missing assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "$workdir"' EXIT
+
+          # One asset at a time to avoid filling the Actions runner's disk.
+          gh api --paginate "repos/${UPSTREAM_REPO}/releases?per_page=100" --jq '.[].tag_name' |
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            echo "::group::Release ${tag}"
+            gh api "repos/${UPSTREAM_REPO}/releases/tags/${tag}" > "$workdir/source.json"
+            title="$(jq -r '.name // .tag_name' "$workdir/source.json")"
+            jq -r '.body // ""' "$workdir/source.json" > "$workdir/notes.md"
+            is_prerelease="$(jq -r '.prerelease' "$workdir/source.json")"
+
+            if ! gh release view "$tag" --repo "$ARCHIVE_REPO" >/dev/null 2>&1; then
+              options=(--title "$title" --notes-file "$workdir/notes.md" --verify-tag)
+              if [[ "$is_prerelease" == 'true' ]]; then
+                options+=(--prerelease)
+              fi
+              gh release create "$tag" --repo "$ARCHIVE_REPO" "${options[@]}"
+            else
+              # Keep edited upstream release notes/title in sync.
+              gh release edit "$tag" --repo "$ARCHIVE_REPO" \
+                --title "$title" --notes-file "$workdir/notes.md"
+            fi
+
+            # Existing copied assets are intentionally never deleted or overwritten.
+            gh release view "$tag" --repo "$ARCHIVE_REPO" --json assets \
+              --jq '.assets[].name' > "$workdir/existing-assets.txt"
+            while IFS= read -r asset; do
+              [[ -n "$asset" ]] || continue
+              if grep -Fxq -- "$asset" "$workdir/existing-assets.txt"; then
+                echo "Already archived: ${tag}/${asset}"
+                continue
+              fi
+              mkdir -p "$workdir/assets"
+              gh release download "$tag" --repo "$UPSTREAM_REPO" \
+                --pattern "$asset" --dir "$workdir/assets"
+              test -f "$workdir/assets/$asset"
+              gh release upload "$tag" "$workdir/assets/$asset" --repo "$ARCHIVE_REPO"
+              rm -f -- "$workdir/assets/$asset"
+              echo "$asset" >> "$workdir/existing-assets.txt"
+            done < <(jq -r '.assets[].name' "$workdir/source.json")
+            echo '::endgroup::'
+          done
